@@ -249,6 +249,25 @@ enum UsageParser {
                                            short: name))
             }
         }
+        // Oturum (5 saat) limiti üst düzeyde yoksa limits[] içinden al (kind "session").
+        if !windows.contains(where: { $0.id == "five_hour" }),
+           let limits = root["limits"] as? [[String: Any]] {
+            for entry in limits {
+                let kind = (entry["kind"] as? String ?? "").lowercased()
+                let group = (entry["group"] as? String ?? "").lowercased()
+                let isSession = kind.contains("session") || kind.contains("five_hour") || kind.contains("5h")
+                    || group == "session" || group == "five_hour"
+                guard isSession, let pct = number(entry["percent"]) ?? number(entry["utilization"]) else {
+                    continue
+                }
+                windows.append(LimitWindow(id: "five_hour",
+                                           title: "Oturum · 5 saat",
+                                           percent: pct,
+                                           resetsAt: date(entry["resets_at"]),
+                                           windowLength: 5 * 3600))
+                break
+            }
+        }
         // Haftalık ana limit yoksa oauth_apps penceresini yedek olarak kullan.
         if !windows.contains(where: { $0.id == "seven_day" }),
            let fallback = makeWindow(key: "seven_day", value: root["seven_day_oauth_apps"]) {
@@ -584,9 +603,16 @@ enum ActivityScanner {
     static let workingWindow: TimeInterval = 90
 
     static func scan() -> ActivityInfo {
-        let procs = ProcessScanner.ownProcesses().filter(isClaudeCode)
-        let files = ProcessScanner.openFiles(of: procs.map(\.pid))
+        let candidates = ProcessScanner.ownProcesses().filter(isClaudeCode)
+        let files = ProcessScanner.openFiles(of: candidates.map(\.pid))
         let dirs = files.compactMapValues { $0.cwd }
+        // ~/.claude içinde çalışan yardımcı süreçler proje oturumu değildir.
+        let claudeHome = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".claude").path
+        let procs = candidates.filter { p in
+            guard let dir = dirs[p.pid] else { return true }
+            return dir != claudeHome && !dir.hasPrefix(claudeHome + "/")
+        }
         var tally = ProjectTally()
         for p in procs { tally.add(dirs[p.pid], open: 1) }
 
@@ -674,6 +700,10 @@ enum ActivityScanner {
     /// Native kurulum ("claude", ~/.local/share/claude/versions/<sürüm>), Claude masaüstü
     /// uygulamasının paketlediği claude-code ve npm (node …/claude-code/cli.js) kurulumu.
     private static func isClaudeCode(_ p: ProcessScanner.Info) -> Bool {
+        // Claude in Chrome bağlantısı (claude --chrome-native-host) bir oturum değil.
+        if p.argv.contains(where: { $0.hasSuffix("native-host") || $0 == "--chrome-native-host" }) {
+            return false
+        }
         if p.execName == "node" {
             guard p.argv.count > 1 else { return false }
             let script = p.argv[1]
