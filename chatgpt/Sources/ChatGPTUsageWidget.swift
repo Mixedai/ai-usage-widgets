@@ -372,7 +372,12 @@ struct ProjectTally {
 
     /// Önce çalışanlar, sonra açık olanlar, sonra ada göre.
     var sorted: [ProjectActivity] {
-        map.values.sorted {
+        map.values.map { p -> ProjectActivity in
+            // Bir projede açık oturumdan fazla "çalışan" oturum olamaz.
+            var capped = p
+            if capped.open > 0 { capped.working = min(capped.working, capped.open) }
+            return capped
+        }.sorted {
             ($0.working + $0.agents, $0.open, $1.name) > ($1.working + $1.agents, $1.open, $0.name)
         }
     }
@@ -426,12 +431,24 @@ enum ActivityScanner {
         var tally = ProjectTally()
         for p in procs { tally.add(dirs[p.pid], open: 1) }
 
-        let recent = recentRollouts()
-        for url in recent { tally.add(TranscriptReader.cwd(of: url), working: 1) }
+        // Kayıtlar yalnızca hâlâ açık bir oturumun projesine aitse sayılır.
+        let liveDirs = Set(procs.compactMap { dirs[$0.pid] })
+        let unknownLive = procs.contains { dirs[$0.pid] == nil }
+        if !procs.isEmpty {
+            for url in recentRollouts() {
+                let cwd = TranscriptReader.cwd(of: url)
+                if let cwd, liveDirs.contains(cwd) {
+                    tally.add(cwd, working: 1)
+                } else if unknownLive {
+                    tally.add(cwd, working: 1)
+                }
+            }
+        }
+        let projects = tally.sorted
         return ActivityInfo(open: procs.count,
-                            working: procs.isEmpty ? recent.count : min(recent.count, procs.count),
+                            working: projects.reduce(0) { $0 + $1.working },
                             agents: nil,
-                            projects: tally.sorted)
+                            projects: projects)
     }
 
     /// Native codex süreci. npm kurulumundaki node sarmalayıcısı sayılmaz
@@ -503,14 +520,14 @@ final class UsageStore: ObservableObject {
 
     func refreshNow() { startLoop() }
 
-    /// Oturum/agent sayıları: yerel tarama, 15 sn'de bir (ağ isteği yok).
+    /// Oturum/agent sayıları: yerel tarama, 10 sn'de bir (ağ isteği yok).
     private func startActivityLoop() {
         activityTask?.cancel()
         activityTask = Task { [weak self] in
             while !Task.isCancelled {
                 let info = await Task.detached(priority: .utility) { ActivityScanner.scan() }.value
                 self?.activity = info
-                try? await Task.sleep(nanoseconds: 15_000_000_000)
+                try? await Task.sleep(nanoseconds: 10_000_000_000)
             }
         }
     }

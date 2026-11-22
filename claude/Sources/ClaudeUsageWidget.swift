@@ -415,7 +415,12 @@ struct ProjectTally {
 
     /// Önce çalışanlar, sonra açık olanlar, sonra ada göre.
     var sorted: [ProjectActivity] {
-        map.values.sorted {
+        map.values.map { p -> ProjectActivity in
+            // Bir projede açık oturumdan fazla "çalışan" oturum olamaz.
+            var capped = p
+            if capped.open > 0 { capped.working = min(capped.working, capped.open) }
+            return capped
+        }.sorted {
             ($0.working + $0.agents, $0.open, $1.name) > ($1.working + $1.agents, $1.open, $0.name)
         }
     }
@@ -469,22 +474,48 @@ enum ActivityScanner {
         var tally = ProjectTally()
         for p in procs { tally.add(dirs[p.pid], open: 1) }
 
-        var sessions = 0
+        // Kayıtlar yalnızca hâlâ açık bir oturumun projesine aitse sayılır:
+        // kapatılan oturumun son 90 sn içindeki kaydı "çalışıyor" görünmesin.
+        let liveDirs = Set(procs.compactMap { dirs[$0.pid] })
+        var liveBySlug: [String: String] = [:]
+        for dir in liveDirs { liveBySlug[slug(for: dir)] = dir }
+        let unknownLive = procs.contains { dirs[$0.pid] == nil }
+
         var agents = 0
-        for item in recentTranscripts() {
-            let cwd = TranscriptReader.cwd(of: item.url)
-            if item.isAgent {
-                agents += 1
-                tally.add(cwd, agents: 1)
-            } else {
-                sessions += 1
-                tally.add(cwd, working: 1)
+        if !procs.isEmpty {
+            for item in recentTranscripts() {
+                var project = liveBySlug[item.slug]
+                if project == nil {
+                    let cwd = TranscriptReader.cwd(of: item.url)
+                    if let cwd, liveDirs.contains(cwd) {
+                        project = cwd
+                    } else if unknownLive {
+                        project = cwd ?? "?"
+                    }
+                }
+                guard let projectPath = project else { continue }
+                if item.isAgent {
+                    agents += 1
+                    tally.add(projectPath, agents: 1)
+                } else {
+                    tally.add(projectPath, working: 1)
+                }
             }
         }
+        let projects = tally.sorted
         return ActivityInfo(open: procs.count,
-                            working: procs.isEmpty ? sessions : min(sessions, procs.count),
+                            working: projects.reduce(0) { $0 + $1.working },
                             agents: agents,
-                            projects: tally.sorted)
+                            projects: projects)
+    }
+
+    /// Claude Code'un ~/.claude/projects altındaki klasör adı: harf/rakam dışındaki
+    /// her karakter "-" olur (örn. /Users/a/my.app → -Users-a-my-app).
+    static func slug(for path: String) -> String {
+        String(path.utf16.map { unit -> Character in
+            let isAlnum = (48...57).contains(unit) || (65...90).contains(unit) || (97...122).contains(unit)
+            return isAlnum ? Character(UnicodeScalar(UInt8(unit))) : "-"
+        })
     }
 
     /// Native kurulum ("claude", ~/.local/share/claude/versions/<sürüm>), Claude masaüstü
@@ -503,7 +534,7 @@ enum ActivityScanner {
 
     /// ~/.claude/projects altında son 90 sn içinde değişen kayıtlar:
     /// <session>.jsonl = ana oturum, …/subagents/agent-*.jsonl = alt agent.
-    private static func recentTranscripts() -> [(url: URL, isAgent: Bool)] {
+    private static func recentTranscripts() -> [(url: URL, slug: String, isAgent: Bool)] {
         let root = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".claude/projects")
         let keys: [URLResourceKey] = [.contentModificationDateKey, .isRegularFileKey]
@@ -512,7 +543,7 @@ enum ActivityScanner {
                                                           options: [.skipsHiddenFiles])
         else { return [] }
         let cutoff = Date().addingTimeInterval(-workingWindow)
-        var found: [(url: URL, isAgent: Bool)] = []
+        var found: [(url: URL, slug: String, isAgent: Bool)] = []
         for case let url as URL in walker {
             guard url.pathExtension == "jsonl",
                   let values = try? url.resourceValues(forKeys: Set(keys)),
@@ -521,7 +552,11 @@ enum ActivityScanner {
                   modified > cutoff
             else { continue }
             let isAgent = url.path.contains("/subagents/") || url.lastPathComponent.hasPrefix("agent-")
-            found.append((url, isAgent))
+            var slug = ""
+            if let r = url.path.range(of: "/.claude/projects/") {
+                slug = url.path[r.upperBound...].split(separator: "/").first.map(String.init) ?? ""
+            }
+            found.append((url, slug, isAgent))
         }
         return found
     }
@@ -602,14 +637,14 @@ final class UsageStore: ObservableObject {
         refreshNow()
     }
 
-    /// Oturum/agent sayıları: yerel tarama, 15 sn'de bir (ağ isteği yok).
+    /// Oturum/agent sayıları: yerel tarama, 10 sn'de bir (ağ isteği yok).
     private func startActivityLoop() {
         activityTask?.cancel()
         activityTask = Task { [weak self] in
             while !Task.isCancelled {
                 let info = await Task.detached(priority: .utility) { ActivityScanner.scan() }.value
                 self?.activity = info
-                try? await Task.sleep(nanoseconds: 15_000_000_000)
+                try? await Task.sleep(nanoseconds: 10_000_000_000)
             }
         }
     }
