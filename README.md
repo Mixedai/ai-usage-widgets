@@ -24,7 +24,8 @@ No menu bar clutter, no dependencies, no Xcode project. Each widget is a single 
 - **Pace marker:** the thin white tick on each bar shows how much of the window has elapsed. If the fill is left of the tick, you're fine. If it's right of the tick, you'll hit the limit before it resets.
 - **Extras:** Claude extra-usage spend; Codex credits and available limit resets
 - Floats above all windows and on every Space. Drag to move (position is remembered).
-- Right-click menu: refresh, compact mode, opacity, start at login, open usage page, quit
+- **Minimize** with the – button in the header: the widget collapses into a thin one-line strip (logo + mini bars + %). Click the expand icon to bring the full card back.
+- Right-click menu: refresh, compact mode, mini strip, opacity, start at login, open usage page, quit
 - Refresh: ChatGPT every 60 s; Claude every 5 min, because Anthropic's usage endpoint shares a strict request quota with your running Claude Code sessions. On HTTP 429 the Claude widget keeps showing the last data and backs off (10 → 20 → 30 min). The last snapshot is cached on disk, so it shows up instantly on relaunch. Click the clock to refresh now.
 
 ## Requirements

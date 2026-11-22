@@ -539,11 +539,25 @@ struct WidgetView: View {
 
     @AppStorage("compact") private var compact = false
     @AppStorage("opacity") private var opacity = 1.0
+    @AppStorage("mini") private var mini = false
     // Property-wrapper macro'ları kullanılmıyor: Command Line Tools'taki swiftc
     // SwiftUI macro eklentisini bulamıyor.
     private let drag = DragTracker()
 
     var body: some View {
+        Group {
+            if mini { miniStrip } else { fullCard }
+        }
+        .opacity(opacity)
+        .gesture(dragGesture)
+        .contextMenu { menu }
+        .fixedSize()
+        .background(GeometryReader { Color.clear.preference(key: SizeKey.self, value: $0.size) })
+        .onPreferenceChange(SizeKey.self) { onSize($0) }
+        .environment(\.colorScheme, .dark)
+    }
+
+    private var fullCard: some View {
         VStack(alignment: .leading, spacing: compact ? 8 : 11) {
             header
             content
@@ -557,21 +571,59 @@ struct WidgetView: View {
                 .strokeBorder(Color.white.opacity(0.09), lineWidth: 1)
         )
         .contentShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-        .opacity(opacity)
-        .gesture(dragGesture)
-        .contextMenu { menu }
-        .fixedSize()
-        .background(GeometryReader { Color.clear.preference(key: SizeKey.self, value: $0.size) })
-        .onPreferenceChange(SizeKey.self) { onSize($0) }
-        .environment(\.colorScheme, .dark)
     }
 
-    // Header: başlık, plan rozeti, son güncelleme / yenile
+    /// Küçültülmüş hali: tek satırlık ince şerit.
+    private var miniStrip: some View {
+        HStack(spacing: 10) {
+            brandIcon
+            if let snap = store.snapshot {
+                ForEach(mainWindows(snap)) { w in
+                    MiniGauge(window: w)
+                }
+            } else {
+                Text(store.error == nil ? "Yükleniyor…" : "Veri yok")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+            }
+            if store.error != nil {
+                Circle().fill(Color.orange).frame(width: 5, height: 5)
+            }
+            Button(action: { mini = false }) {
+                Image(systemName: "arrow.up.left.and.arrow.down.right")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 16, height: 16)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("Büyüt")
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(VisualEffectBackground(cornerRadius: 10))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .strokeBorder(Color.white.opacity(0.09), lineWidth: 1)
+        )
+        .contentShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .help(helpText)
+    }
+
+    private func mainWindows(_ snap: UsageSnapshot) -> [LimitWindow] {
+        snap.windows.filter { $0.id == "five_hour" || $0.id == "seven_day" }
+    }
+
+    private var brandIcon: some View {
+        Image(systemName: "chart.bar.fill")
+            .font(.system(size: 10, weight: .bold))
+            .foregroundStyle(Color(red: 0.85, green: 0.47, blue: 0.34))
+    }
+
+    // Header: başlık, plan rozeti, son güncelleme / yenile, küçült
     private var header: some View {
         HStack(spacing: 6) {
-            Image(systemName: "chart.bar.fill")
-                .font(.system(size: 10, weight: .bold))
-                .foregroundStyle(Color(red: 0.85, green: 0.47, blue: 0.34))
+            brandIcon
             Text("Claude")
                 .font(.system(size: 12, weight: .semibold))
             if let plan = store.snapshot?.plan, !plan.isEmpty {
@@ -583,6 +635,15 @@ struct WidgetView: View {
             }
             Spacer(minLength: 4)
             status
+            Button(action: { mini = true }) {
+                Image(systemName: "minus")
+                    .font(.system(size: 10, weight: .bold))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 16, height: 16)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("Küçült")
         }
     }
 
@@ -620,7 +681,7 @@ struct WidgetView: View {
     @ViewBuilder private var content: some View {
         if let snap = store.snapshot {
             let rows = compact
-                ? snap.windows.filter { $0.id == "five_hour" || $0.id == "seven_day" }
+                ? mainWindows(snap)
                 : snap.windows
             ForEach(rows) { w in
                 LimitRow(window: w, now: store.now, compact: compact)
@@ -652,6 +713,7 @@ struct WidgetView: View {
     @ViewBuilder private var menu: some View {
         Button("Şimdi yenile") { store.refreshNow() }
         Toggle("Kompakt görünüm", isOn: $compact)
+        Toggle("Küçük şerit", isOn: $mini)
         Menu("Saydamlık") {
             ForEach([1.0, 0.85, 0.7, 0.5], id: \.self) { value in
                 Button(action: { opacity = value }) {
@@ -694,6 +756,37 @@ struct WidgetView: View {
 /// Sürükleme başlangıcını tutan küçük referans tipi (@State yerine).
 final class DragTracker {
     var start: (mouse: NSPoint, origin: NSPoint)?
+}
+
+/// Küçük şeritteki tek limit: etiket, mini bar, yüzde.
+struct MiniGauge: View {
+    let window: LimitWindow
+
+    var body: some View {
+        HStack(spacing: 5) {
+            Text(verbatim: shortLabel)
+                .font(.system(size: 10, weight: .medium))
+                .foregroundStyle(.secondary)
+            ZStack(alignment: .leading) {
+                Capsule().fill(Color.primary.opacity(0.12))
+                Capsule()
+                    .fill(levelColor(window.percent).gradient)
+                    .frame(width: max(3, 36 * min(max(window.percent, 0), 100) / 100))
+            }
+            .frame(width: 36, height: 4)
+            Text(verbatim: "\(Int(window.percent.rounded()))%")
+                .font(.system(size: 11, weight: .semibold, design: .rounded))
+                .monospacedDigit()
+                .foregroundStyle(levelColor(window.percent))
+        }
+    }
+
+    private var shortLabel: String {
+        guard let length = window.windowLength else { return "" }
+        if length >= 6 * 86400 { return "Hafta" }
+        if length < 86400 { return "\(Int((length / 3600).rounded())) sa" }
+        return "\(Int((length / 86400).rounded())) gün"
+    }
 }
 
 struct LimitRow: View {
