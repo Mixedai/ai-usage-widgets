@@ -613,8 +613,35 @@ enum ActivityScanner {
             guard let dir = dirs[p.pid] else { return true }
             return dir != claudeHome && !dir.hasPrefix(claudeHome + "/")
         }
+        // Ana klasörde (ya da "/") başlatılmış oturumlar: gerçekte çalıştıkları klasör
+        // kayıtlarındaki son "cwd" alanından okunur (örn. IDE klasörsüz açıldığında).
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let isGeneric: (String) -> Bool = { $0 == home || $0 == "/" }
+        let projectRoots = Set(procs.compactMap { dirs[$0.pid] }).filter { !isGeneric($0) }
+        // Alt klasörleri, açık bir oturumun proje köküne bağla (proje bölünmesin).
+        let normalize: (String) -> String = { path in
+            projectRoots.filter { path == $0 || path.hasPrefix($0 + "/") }.max { $0.count < $1.count } ?? path
+        }
+        let realProject: (URL) -> String? = { url in
+            guard let cwd = TranscriptReader.cwd(of: url), !isGeneric(cwd) else { return nil }
+            return normalize(cwd)
+        }
+
+        var effective = dirs
+        var genericGroups: [String: [ProcessScanner.Info]] = [:]
+        for p in procs {
+            if let dir = dirs[p.pid], isGeneric(dir) { genericGroups[dir, default: []].append(p) }
+        }
+        for (dir, group) in genericGroups {
+            let earliest = group.compactMap { $0.startTime }.min()
+            let transcripts = latestMainTranscripts(slug: slug(for: dir), notBefore: earliest, count: group.count)
+            for (p, url) in zip(group, transcripts) {
+                if let real = realProject(url) { effective[p.pid] = real }
+            }
+        }
+
         var tally = ProjectTally()
-        for p in procs { tally.add(dirs[p.pid], open: 1) }
+        for p in procs { tally.add(effective[p.pid], open: 1) }
 
         // Kayıtlar yalnızca hâlâ açık bir oturumun projesine aitse sayılır:
         // kapatılan oturumun son 90 sn içindeki kaydı "çalışıyor" görünmesin.
@@ -635,7 +662,8 @@ enum ActivityScanner {
                         project = cwd ?? "?"
                     }
                 }
-                guard let projectPath = project else { continue }
+                guard var projectPath = project else { continue }
+                if isGeneric(projectPath), let real = realProject(item.url) { projectPath = real }
                 if item.isAgent {
                     agents += 1
                     tally.add(projectPath, agents: 1)
@@ -655,9 +683,10 @@ enum ActivityScanner {
             let transcripts = latestMainTranscripts(slug: slug(for: dir), notBefore: earliest, count: group.count)
             for (index, url) in transcripts.enumerated() {
                 guard let ctx = ClaudeContext.read(url) else { continue }
+                let label = isGeneric(dir) ? (realProject(url) ?? dir) : dir
                 contexts.append(SessionContext(id: "\(dir)#\(index)",
-                                               project: ProjectTally.displayName(dir),
-                                               path: dir,
+                                               project: ProjectTally.displayName(label),
+                                               path: label,
                                                used: ctx.used,
                                                limit: ClaudeContext.limit(model: ctx.model, used: ctx.used),
                                                model: ctx.model))
