@@ -338,6 +338,7 @@ struct ActivityInfo: Sendable {
     let working: Int       // son 90 sn içinde kaydına yazmış oturumlar
     let agents: Int?       // son 90 sn içinde çalışmış alt agent'lar (yoksa nil)
     let projects: [ProjectActivity]
+    let sessions: [SessionContext]
 }
 
 /// Kullanıcının kendi süreçlerini ve argv'lerini okur (ps çalıştırmadan, sysctl ile).
@@ -346,6 +347,7 @@ enum ProcessScanner {
         let pid: pid_t
         let execPath: String
         let argv: [String]
+        let startTime: Date?
 
         var execName: String { (execPath as NSString).lastPathComponent }
         var arg0Name: String { argv.first.map { ($0 as NSString).lastPathComponent } ?? "" }
@@ -360,10 +362,16 @@ enum ProcessScanner {
         size = procs.count * stride
         guard sysctl(&mib, 4, &procs, &size, nil, 0) == 0 else { return [] }
         let count = size / stride
-        return procs.prefix(count).compactMap { info(pid: $0.kp_proc.p_pid) }
+        return procs.prefix(count).compactMap { info(pid: $0.kp_proc.p_pid, start: startDate($0)) }
     }
 
-    private static func info(pid: pid_t) -> Info? {
+    private static func startDate(_ kp: kinfo_proc) -> Date? {
+        let tv = kp.kp_proc.p_un.__p_starttime
+        guard tv.tv_sec > 0 else { return nil }
+        return Date(timeIntervalSince1970: TimeInterval(tv.tv_sec) + TimeInterval(tv.tv_usec) / 1_000_000)
+    }
+
+    private static func info(pid: pid_t, start: Date?) -> Info? {
         guard pid > 0 else { return nil }
         var mib: [Int32] = [CTL_KERN, KERN_PROCARGS2, pid]
         var size = 0
@@ -383,31 +391,116 @@ enum ProcessScanner {
             argv.append(String(decoding: buffer[start..<i], as: UTF8.self))
             i += 1
         }
-        return Info(pid: pid, execPath: execPath, argv: argv)
+        return Info(pid: pid, execPath: execPath, argv: argv, startTime: start)
     }
 
-    /// Süreçlerin çalışma klasörleri (proje). Tek bir lsof çağrısı.
-    static func workingDirectories(of pids: [pid_t]) -> [pid_t: String] {
+    struct OpenFiles {
+        var cwd: String?
+        var jsonl: [String] = []
+    }
+
+    /// Süreçlerin çalışma klasörü (proje) ve açık tuttukları .jsonl kayıtları. Tek bir lsof çağrısı.
+    static func openFiles(of pids: [pid_t]) -> [pid_t: OpenFiles] {
         guard !pids.isEmpty else { return [:] }
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
-        process.arguments = ["-a", "-d", "cwd", "-p", pids.map { String($0) }.joined(separator: ","), "-Fn"]
+        process.arguments = ["-n", "-P", "-p", pids.map { String($0) }.joined(separator: ","), "-Ffn"]
         let out = Pipe()
         process.standardOutput = out
         process.standardError = FileHandle.nullDevice
         do { try process.run() } catch { return [:] }
         let data = out.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()
-        var result: [pid_t: String] = [:]
+        var result: [pid_t: OpenFiles] = [:]
         var current: pid_t?
+        var fd = ""
         for line in String(decoding: data, as: UTF8.self).split(separator: "\n") {
-            if line.hasPrefix("p") {
-                current = pid_t(line.dropFirst())
-            } else if line.hasPrefix("n"), let pid = current {
-                result[pid] = String(line.dropFirst())
+            guard let tag = line.first else { continue }
+            let value = String(line.dropFirst())
+            switch tag {
+            case "p":
+                current = pid_t(value)
+                fd = ""
+            case "f":
+                fd = value
+            case "n":
+                guard let pid = current else { continue }
+                var entry = result[pid] ?? OpenFiles()
+                if fd == "cwd" {
+                    entry.cwd = value
+                } else if value.hasSuffix(".jsonl") {
+                    entry.jsonl.append(value)
+                }
+                result[pid] = entry
+            default:
+                break
             }
         }
         return result
+    }
+}
+
+/// Bir oturumun context doluluğu.
+struct SessionContext: Sendable, Identifiable {
+    let id: String
+    let project: String     // klasör adı
+    let path: String        // tam klasör yolu
+    let used: Int           // son yanıttaki context token'ı
+    let limit: Int          // modelin context penceresi
+    let model: String?
+
+    var fraction: Double { limit > 0 ? Double(used) / Double(limit) : 0 }
+}
+
+/// Dosyanın son kısmını okur (büyük kayıtları baştan sona okumamak için).
+enum ContextReader {
+    static func tail(of url: URL, bytes: UInt64) -> String? {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+        guard let end = try? handle.seekToEnd() else { return nil }
+        try? handle.seek(toOffset: end > bytes ? end - bytes : 0)
+        guard let data = try? handle.readToEnd() else { return nil }
+        return String(decoding: data, as: UTF8.self)
+    }
+
+    static func modified(_ url: URL) -> Date? {
+        try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
+    }
+}
+
+/// Claude Code kaydının son ana-oturum yanıtından context token'ı ve modeli.
+enum ClaudeContext {
+    private static var cache: [String: (modified: Date, used: Int, model: String?)] = [:]
+
+    static func read(_ url: URL) -> (used: Int, model: String?)? {
+        let modified = ContextReader.modified(url) ?? Date()
+        if let c = cache[url.path], c.modified == modified { return (c.used, c.model) }
+        guard let text = ContextReader.tail(of: url, bytes: 524_288) else { return nil }
+        for line in text.split(separator: "\n").reversed() {
+            guard line.contains("\"usage\""), line.contains("\"assistant\"") else { continue }
+            guard let obj = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+                  (obj["type"] as? String) == "assistant",
+                  (obj["isSidechain"] as? Bool) != true,
+                  let message = obj["message"] as? [String: Any],
+                  let usage = message["usage"] as? [String: Any]
+            else { continue }
+            let model = message["model"] as? String
+            if model == "<synthetic>" { continue }
+            let used = ["input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"]
+                .compactMap { (usage[$0] as? NSNumber)?.intValue }
+                .reduce(0, +)
+            cache[url.path] = (modified, used, model)
+            return (used, model)
+        }
+        return nil
+    }
+
+    /// Güncel Claude modellerinin (Opus 5.5, Sonnet 5.5, Fable 5.2) context penceresi 1M token.
+    /// Haiku için 200k varsayılır; kullanım bunu aşarsa 1M kabul edilir.
+    static func limit(model: String?, used: Int) -> Int {
+        let m = (model ?? "").lowercased()
+        let base = m.contains("haiku") ? 200_000 : 1_000_000
+        return used > base ? 1_000_000 : base
     }
 }
 
@@ -447,7 +540,7 @@ struct ProjectTally {
         }
     }
 
-    private static func displayName(_ path: String) -> String {
+    static func displayName(_ path: String) -> String {
         if path == "?" { return "bilinmeyen klasör" }
         if path == FileManager.default.homeDirectoryForCurrentUser.path { return "~ (ana klasör)" }
         let name = (path as NSString).lastPathComponent
@@ -492,7 +585,8 @@ enum ActivityScanner {
 
     static func scan() -> ActivityInfo {
         let procs = ProcessScanner.ownProcesses().filter(isClaudeCode)
-        let dirs = ProcessScanner.workingDirectories(of: procs.map(\.pid))
+        let files = ProcessScanner.openFiles(of: procs.map(\.pid))
+        let dirs = files.compactMapValues { $0.cwd }
         var tally = ProjectTally()
         for p in procs { tally.add(dirs[p.pid], open: 1) }
 
@@ -524,11 +618,48 @@ enum ActivityScanner {
                 }
             }
         }
+        // Context: her açık oturumun kaydındaki son yanıt / modelin context limiti.
+        var contexts: [SessionContext] = []
+        var byDir: [String: [ProcessScanner.Info]] = [:]
+        for p in procs {
+            if let dir = dirs[p.pid] { byDir[dir, default: []].append(p) }
+        }
+        for (dir, group) in byDir {
+            let earliest = group.compactMap { $0.startTime }.min()
+            let transcripts = latestMainTranscripts(slug: slug(for: dir), notBefore: earliest, count: group.count)
+            for (index, url) in transcripts.enumerated() {
+                guard let ctx = ClaudeContext.read(url) else { continue }
+                contexts.append(SessionContext(id: "\(dir)#\(index)",
+                                               project: ProjectTally.displayName(dir),
+                                               path: dir,
+                                               used: ctx.used,
+                                               limit: ClaudeContext.limit(model: ctx.model, used: ctx.used),
+                                               model: ctx.model))
+            }
+        }
+        contexts.sort { $0.fraction > $1.fraction }
+
         let projects = tally.sorted
         return ActivityInfo(open: procs.count,
                             working: projects.reduce(0) { $0 + $1.working },
                             agents: agents,
-                            projects: projects)
+                            projects: projects,
+                            sessions: contexts)
+    }
+
+    /// Projenin en son değişen ana oturum kayıtları (süreç başladıktan sonra yazılmış olanlar).
+    private static func latestMainTranscripts(slug: String, notBefore: Date?, count: Int) -> [URL] {
+        let dir = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".claude/projects")
+            .appendingPathComponent(slug)
+        guard let files = try? FileManager.default.contentsOfDirectory(
+            at: dir, includingPropertiesForKeys: [.contentModificationDateKey]) else { return [] }
+        let threshold = notBefore?.addingTimeInterval(-5) ?? .distantPast
+        var dated: [(url: URL, modified: Date)] = []
+        for url in files where url.pathExtension == "jsonl" && !url.lastPathComponent.hasPrefix("agent-") {
+            if let m = ContextReader.modified(url), m >= threshold { dated.append((url, m)) }
+        }
+        return dated.sorted { $0.modified > $1.modified }.prefix(count).map { $0.url }
     }
 
     /// Claude Code'un ~/.claude/projects altındaki klasör adı: harf/rakam dışındaki
@@ -806,6 +937,16 @@ enum Fmt {
     }
 
     static func usd(_ v: Double) -> String { String(format: "$%.2f", v) }
+
+    /// 143_000 → "143k", 1_000_000 → "1M", 272_000 → "272k"
+    static func tokens(_ n: Int) -> String {
+        if n >= 1_000_000 {
+            let v = Double(n) / 1_000_000
+            return v == v.rounded() ? "\(Int(v))M" : String(format: "%.1fM", v)
+        }
+        if n >= 1_000 { return "\(Int((Double(n) / 1_000).rounded()))k" }
+        return "\(n)"
+    }
 }
 
 func levelColor(_ percent: Double) -> Color {
@@ -870,6 +1011,23 @@ struct WidgetView: View {
                     }
                     if a.projects.count > 6 {
                         Text("+\(a.projects.count - 6) proje daha")
+                            .font(.system(size: 9.5))
+                            .foregroundStyle(.tertiary)
+                    }
+                }
+                .padding(.top, 2)
+            }
+
+            if !a.sessions.isEmpty {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Context doluluğu")
+                        .font(.system(size: 9.5, weight: .semibold))
+                        .foregroundStyle(.tertiary)
+                    ForEach(a.sessions.prefix(6)) { session in
+                        ContextRow(session: session)
+                    }
+                    if a.sessions.count > 6 {
+                        Text("+\(a.sessions.count - 6) oturum daha")
                             .font(.system(size: 9.5))
                             .foregroundStyle(.tertiary)
                     }
@@ -1079,6 +1237,43 @@ struct WidgetView: View {
 /// Sürükleme başlangıcını tutan küçük referans tipi (@State yerine).
 final class DragTracker {
     var start: (mouse: NSPoint, origin: NSPoint)?
+}
+
+/// Context satırı: proje adı, doluluk barı, kullanılan / limit.
+struct ContextRow: View {
+    let session: SessionContext
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Text(session.project)
+                .font(.system(size: 10.5, weight: .medium))
+                .lineLimit(1)
+                .truncationMode(.middle)
+            Spacer(minLength: 6)
+            ZStack(alignment: .leading) {
+                Capsule().fill(Color.primary.opacity(0.12))
+                Capsule()
+                    .fill(levelColor(percent).gradient)
+                    .frame(width: max(3, 44 * min(session.fraction, 1)))
+            }
+            .frame(width: 44, height: 4)
+            Text(verbatim: "\(Fmt.tokens(session.used)) / \(Fmt.tokens(session.limit))")
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+                .monospacedDigit()
+                .lineLimit(1)
+                .layoutPriority(1)
+        }
+        .help(helpText)
+    }
+
+    private var percent: Double { session.fraction * 100 }
+
+    private var helpText: String {
+        var lines = [session.path, "Context: %\(Int(percent.rounded())) dolu"]
+        if let model = session.model { lines.append("Model: \(model)") }
+        return lines.joined(separator: "\n")
+    }
 }
 
 /// Proje satırı: yeşil nokta = o an çalışıyor.
