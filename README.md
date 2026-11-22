@@ -5,15 +5,25 @@ Tiny always-on-top macOS widgets that show your **live Claude (Pro/Max)** and **
 No menu bar clutter, no dependencies, no Xcode project. Each widget is a single Swift file you build with one command.
 
 ```
-┌──────────────────────────────┐
-│ ▮ Claude  MAX          17:22 │
-│ Oturum · 5 saat          34% │
-│ ███████░░░░░│░░░░░░░░░░░░░░░ │
-│ Sıfırlanma: 2 sa 14 dk sonra │
-│ Haftalık · tüm modeller  61% │
-│ ████████████████│░░░░░░░░░░░ │
-│ Sıfırlanma: Pzt 14:00 · …    │
-└──────────────────────────────┘
+┌──────────────────────────────────────┐
+│ ▮ Claude  MAX              17:22  –  │
+│ Oturum · 5 saat                  34% │
+│ ███████░░░░│░░░░░░░░░░░░░░░░░░░░░░░░ │
+│ Haftalık · tüm modeller          61% │
+│ ███████████████│░░░░░░░░░░░░░░░░░░░░ │
+│ Haftalık · Fable                 78% │
+│ ███████████████████│░░░░░░░░░░░░░░░░ │
+│ ──────────────────────────────────── │
+│ Claude Code oturumu  5 açık · 2 çalış.│
+│ Alt agent                3 çalışıyor │
+│ Projeler                             │
+│ ● ai-usage-widgets  2 açık · 3 agent │
+│ ○ kasa                        1 açık │
+│ Context doluluğu                     │
+│ ai-usage-widgets  ▬▬▬▬▬▬░░  812k / 1M │
+└──────────────────────────────────────┘
+
+Minimized:  ▮ 5 sa ▬ 34%  Hafta ▬▬ 61%  Fable ▬▬▬ 78%  ⤢
 ```
 
 > The UI is currently in **Turkish** 🇹🇷. English localization PRs are welcome.
