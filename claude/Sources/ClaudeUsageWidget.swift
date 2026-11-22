@@ -27,6 +27,7 @@ struct LimitWindow: Identifiable, Sendable, Codable {
     let percent: Double                 // 0–100
     let resetsAt: Date?
     let windowLength: TimeInterval?     // tempo işareti için pencere uzunluğu
+    var short: String? = nil            // küçük şeritteki kısa etiket (örn. "Fable")
 }
 
 struct ExtraUsage: Sendable, Codable {
@@ -227,6 +228,27 @@ enum UsageParser {
             else { continue }
             windows.append(window)
         }
+        // Yeni format: limits[] içindeki model bazlı haftalık havuzlar
+        // (kind "weekly_scoped", scope.model.display_name örn. "Fable").
+        if let limits = root["limits"] as? [[String: Any]] {
+            for entry in limits where (entry["kind"] as? String) == "weekly_scoped" {
+                let scope = entry["scope"] as? [String: Any]
+                let name = ((scope?["model"] as? [String: Any])?["display_name"] as? String)
+                    ?? ((scope?["surface"] as? [String: Any])?["display_name"] as? String)
+                    ?? "Model"
+                guard let pct = number(entry["percent"]) ?? number(entry["utilization"]) else { continue }
+                let title = "Haftalık · \(name)"
+                if windows.contains(where: { $0.title.caseInsensitiveCompare(title) == .orderedSame }) {
+                    continue
+                }
+                windows.append(LimitWindow(id: "scoped_\(name.lowercased())",
+                                           title: title,
+                                           percent: pct,
+                                           resetsAt: date(entry["resets_at"]),
+                                           windowLength: 7 * 24 * 3600,
+                                           short: name))
+            }
+        }
         // Haftalık ana limit yoksa oauth_apps penceresini yedek olarak kullan.
         if !windows.contains(where: { $0.id == "seven_day" }),
            let fallback = makeWindow(key: "seven_day", value: root["seven_day_oauth_apps"]) {
@@ -260,7 +282,7 @@ enum UsageParser {
         switch key {
         case "five_hour": return 0
         case "seven_day": return 1
-        default: return 2
+        default: return key.hasPrefix("scoped_") ? 2 : 3
         }
     }
 
@@ -912,7 +934,7 @@ struct WidgetView: View {
     }
 
     private func mainWindows(_ snap: UsageSnapshot) -> [LimitWindow] {
-        snap.windows.filter { $0.id == "five_hour" || $0.id == "seven_day" }
+        snap.windows.filter { $0.id == "five_hour" || $0.id == "seven_day" || $0.id.hasPrefix("scoped_") }
     }
 
     private var brandIcon: some View {
@@ -1135,6 +1157,7 @@ struct MiniGauge: View {
     }
 
     private var shortLabel: String {
+        if let short = window.short, !short.isEmpty { return short }
         guard let length = window.windowLength else { return "" }
         if length >= 6 * 86400 { return "Hafta" }
         if length < 86400 { return "\(Int((length / 3600).rounded())) sa" }

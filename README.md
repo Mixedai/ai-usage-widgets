@@ -20,7 +20,7 @@ No menu bar clutter, no dependencies, no Xcode project. Each widget is a single 
 
 ## Features
 
-- **Live limits:** session (5 h) and weekly usage %, plus per-model weekly limits when your plan has them
+- **Live limits:** session (5 h) and weekly usage %, plus per-model weekly limits when your plan has them, including model-scoped pools such as the **Fable** weekly allowance (read from the `limits[]` array, `kind: "weekly_scoped"`)
 - **Pace marker:** the thin white tick on each bar shows how much of the window has elapsed. If the fill is left of the tick, you're fine. If it's right of the tick, you'll hit the limit before it resets.
 - **Extras:** Claude extra-usage spend; Codex credits and available limit resets
 - **Activity:** number of open Claude Code / Codex sessions, how many are working right now, and running Claude Code subagents, plus a **per-project list** (green dot = working now). Projects come from each process's working directory (`lsof`) and the `cwd` field of recent transcripts. This is computed locally from your processes and transcript files (`~/.claude/projects`, `~/.codex/sessions`) with no network requests.
