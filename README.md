@@ -23,6 +23,7 @@ No menu bar clutter, no dependencies, no Xcode project. Each widget is a single 
 - **Live limits:** session (5 h) and weekly usage %, plus per-model weekly limits when your plan has them
 - **Pace marker:** the thin white tick on each bar shows how much of the window has elapsed. If the fill is left of the tick, you're fine. If it's right of the tick, you'll hit the limit before it resets.
 - **Extras:** Claude extra-usage spend; Codex credits and available limit resets
+- **Activity:** number of open Claude Code / Codex sessions, how many are working right now, and running Claude Code subagents. This is computed locally from your processes and transcript files (`~/.claude/projects`, `~/.codex/sessions`) with no network requests.
 - Floats above all windows and on every Space. Drag to move (position is remembered).
 - **Minimize** with the – button in the header: the widget collapses into a thin one-line strip (logo + mini bars + %). Click the expand icon to bring the full card back.
 - Right-click menu: refresh, compact mode, mini strip, opacity, start at login, open usage page, quit

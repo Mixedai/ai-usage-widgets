@@ -14,6 +14,7 @@
 // swiftc SwiftUI macro eklentisini bulamıyor.
 
 import AppKit
+import Darwin
 import SwiftUI
 
 // MARK: - Models
@@ -265,6 +266,105 @@ enum UsageParser {
     }
 }
 
+// MARK: - Activity (yerel, ağ isteği yok)
+
+struct ActivityInfo: Sendable {
+    let open: Int          // çalışan CLI süreçleri
+    let working: Int       // son 90 sn içinde kaydına yazmış oturumlar
+    let agents: Int?       // son 90 sn içinde çalışmış alt agent'lar (yoksa nil)
+}
+
+/// Kullanıcının kendi süreçlerini ve argv'lerini okur (ps çalıştırmadan, sysctl ile).
+enum ProcessScanner {
+    struct Info {
+        let execPath: String
+        let argv: [String]
+
+        var execName: String { (execPath as NSString).lastPathComponent }
+        var arg0Name: String { argv.first.map { ($0 as NSString).lastPathComponent } ?? "" }
+    }
+
+    static func ownProcesses() -> [Info] {
+        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_UID, Int32(bitPattern: getuid())]
+        var size = 0
+        guard sysctl(&mib, 4, nil, &size, nil, 0) == 0, size > 0 else { return [] }
+        let stride = MemoryLayout<kinfo_proc>.stride
+        var procs = [kinfo_proc](repeating: kinfo_proc(), count: size / stride + 16)
+        size = procs.count * stride
+        guard sysctl(&mib, 4, &procs, &size, nil, 0) == 0 else { return [] }
+        let count = size / stride
+        return procs.prefix(count).compactMap { info(pid: $0.kp_proc.p_pid) }
+    }
+
+    private static func info(pid: pid_t) -> Info? {
+        guard pid > 0 else { return nil }
+        var mib: [Int32] = [CTL_KERN, KERN_PROCARGS2, pid]
+        var size = 0
+        guard sysctl(&mib, 3, nil, &size, nil, 0) == 0, size > 4 else { return nil }
+        var buffer = [UInt8](repeating: 0, count: size)
+        guard sysctl(&mib, 3, &buffer, &size, nil, 0) == 0, size > 4 else { return nil }
+        let argc = Int(buffer[0]) | Int(buffer[1]) << 8 | Int(buffer[2]) << 16 | Int(buffer[3]) << 24
+        var i = 4
+        let execStart = i
+        while i < size && buffer[i] != 0 { i += 1 }
+        let execPath = String(decoding: buffer[execStart..<i], as: UTF8.self)
+        while i < size && buffer[i] == 0 { i += 1 }
+        var argv: [String] = []
+        while argv.count < argc && i < size {
+            let start = i
+            while i < size && buffer[i] != 0 { i += 1 }
+            argv.append(String(decoding: buffer[start..<i], as: UTF8.self))
+            i += 1
+        }
+        return Info(execPath: execPath, argv: argv)
+    }
+}
+
+enum ActivityScanner {
+    static let workingWindow: TimeInterval = 90
+
+    static func scan() -> ActivityInfo {
+        let open = ProcessScanner.ownProcesses().filter(isCodex).count
+        let recent = recentRollouts()
+        return ActivityInfo(open: open,
+                            working: open > 0 ? min(recent, open) : recent,
+                            agents: nil)
+    }
+
+    /// Native codex süreci. npm kurulumundaki node sarmalayıcısı sayılmaz
+    /// (yoksa her oturum iki kez sayılırdı).
+    private static func isCodex(_ p: ProcessScanner.Info) -> Bool {
+        if p.execName == "node" { return false }
+        return p.execName == "codex" || p.arg0Name == "codex"
+    }
+
+    /// ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl — son 7 günün klasörlerinde
+    /// son 90 sn içinde değişen kayıtlar (uzun süren oturumlar eski klasöre yazmaya devam eder).
+    private static func recentRollouts() -> Int {
+        let root = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".codex/sessions")
+        let calendar = Calendar.current
+        let now = Date()
+        let cutoff = now.addingTimeInterval(-workingWindow)
+        var count = 0
+        for offset in 0..<7 {
+            guard let day = calendar.date(byAdding: .day, value: -offset, to: now) else { continue }
+            let c = calendar.dateComponents([.year, .month, .day], from: day)
+            guard let y = c.year, let m = c.month, let d = c.day else { continue }
+            let dir = root.appendingPathComponent(String(format: "%04d/%02d/%02d", y, m, d))
+            guard let files = try? FileManager.default.contentsOfDirectory(
+                at: dir, includingPropertiesForKeys: [.contentModificationDateKey]) else { continue }
+            for file in files where file.pathExtension == "jsonl" {
+                if let modified = try? file.resourceValues(forKeys: [.contentModificationDateKey])
+                    .contentModificationDate, modified > cutoff {
+                    count += 1
+                }
+            }
+        }
+        return count
+    }
+}
+
 // MARK: - Store
 
 @MainActor
@@ -274,6 +374,8 @@ final class UsageStore: ObservableObject {
     @Published private(set) var isLoading = false
     @Published private(set) var now = Date()
     @Published private(set) var loginItemEnabled = LoginItem.isEnabled
+    @Published private(set) var activity: ActivityInfo?
+    private var activityTask: Task<Void, Never>?
 
     private var loop: Task<Void, Never>?
     private var ticker: Timer?
@@ -284,6 +386,7 @@ final class UsageStore: ObservableObject {
     static let rateLimitInterval: TimeInterval = 300
 
     func start() {
+        startActivityLoop()
         startLoop()
         ticker = Timer.scheduledTimer(withTimeInterval: 20, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.now = Date() }
@@ -296,6 +399,18 @@ final class UsageStore: ObservableObject {
     }
 
     func refreshNow() { startLoop() }
+
+    /// Oturum/agent sayıları: yerel tarama, 15 sn'de bir (ağ isteği yok).
+    private func startActivityLoop() {
+        activityTask?.cancel()
+        activityTask = Task { [weak self] in
+            while !Task.isCancelled {
+                let info = await Task.detached(priority: .utility) { ActivityScanner.scan() }.value
+                self?.activity = info
+                try? await Task.sleep(nanoseconds: 15_000_000_000)
+            }
+        }
+    }
 
     func setLoginItem(_ enabled: Bool) {
         LoginItem.set(enabled)
@@ -448,10 +563,23 @@ struct WidgetView: View {
         .environment(\.colorScheme, .dark)
     }
 
+    /// Açık ve çalışan Codex oturumu sayıları (yalnızca büyük kartta).
+    @ViewBuilder private var activityRows: some View {
+        if let a = store.activity {
+            VStack(alignment: .leading, spacing: 5) {
+                Divider().opacity(0.5)
+                ActivityRow(label: "Codex oturumu",
+                            value: "\(a.open) açık · \(a.working) çalışıyor")
+            }
+            .help("Açık: Mac'te çalışan Codex süreçleri.\nÇalışıyor: son 90 sn içinde işlem yapan oturumlar.")
+        }
+    }
+
     private var fullCard: some View {
         VStack(alignment: .leading, spacing: compact ? 8 : 11) {
             header
             content
+            activityRows
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 12)
@@ -651,6 +779,24 @@ struct WidgetView: View {
 /// Sürükleme başlangıcını tutan küçük referans tipi (@State yerine).
 final class DragTracker {
     var start: (mouse: NSPoint, origin: NSPoint)?
+}
+
+/// Etiket – değer satırı (oturum/agent sayıları).
+struct ActivityRow: View {
+    let label: String
+    let value: String
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline) {
+            Text(label)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(.secondary)
+            Spacer(minLength: 6)
+            Text(value)
+                .font(.system(size: 11, weight: .semibold))
+                .monospacedDigit()
+        }
+    }
 }
 
 /// Küçük şeritteki tek limit: etiket, mini bar, yüzde.

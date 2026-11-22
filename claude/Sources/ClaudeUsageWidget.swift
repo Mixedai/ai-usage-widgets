@@ -16,6 +16,7 @@
 //         ClaudeUsageWidget --raw    (ham JSON yanıtı da yazdırır)
 
 import AppKit
+import Darwin
 import SwiftUI
 
 // MARK: - Models
@@ -308,6 +309,115 @@ enum UsageParser {
     }
 }
 
+// MARK: - Activity (yerel, ağ isteği yok)
+
+struct ActivityInfo: Sendable {
+    let open: Int          // çalışan CLI süreçleri
+    let working: Int       // son 90 sn içinde kaydına yazmış oturumlar
+    let agents: Int?       // son 90 sn içinde çalışmış alt agent'lar (yoksa nil)
+}
+
+/// Kullanıcının kendi süreçlerini ve argv'lerini okur (ps çalıştırmadan, sysctl ile).
+enum ProcessScanner {
+    struct Info {
+        let execPath: String
+        let argv: [String]
+
+        var execName: String { (execPath as NSString).lastPathComponent }
+        var arg0Name: String { argv.first.map { ($0 as NSString).lastPathComponent } ?? "" }
+    }
+
+    static func ownProcesses() -> [Info] {
+        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_UID, Int32(bitPattern: getuid())]
+        var size = 0
+        guard sysctl(&mib, 4, nil, &size, nil, 0) == 0, size > 0 else { return [] }
+        let stride = MemoryLayout<kinfo_proc>.stride
+        var procs = [kinfo_proc](repeating: kinfo_proc(), count: size / stride + 16)
+        size = procs.count * stride
+        guard sysctl(&mib, 4, &procs, &size, nil, 0) == 0 else { return [] }
+        let count = size / stride
+        return procs.prefix(count).compactMap { info(pid: $0.kp_proc.p_pid) }
+    }
+
+    private static func info(pid: pid_t) -> Info? {
+        guard pid > 0 else { return nil }
+        var mib: [Int32] = [CTL_KERN, KERN_PROCARGS2, pid]
+        var size = 0
+        guard sysctl(&mib, 3, nil, &size, nil, 0) == 0, size > 4 else { return nil }
+        var buffer = [UInt8](repeating: 0, count: size)
+        guard sysctl(&mib, 3, &buffer, &size, nil, 0) == 0, size > 4 else { return nil }
+        let argc = Int(buffer[0]) | Int(buffer[1]) << 8 | Int(buffer[2]) << 16 | Int(buffer[3]) << 24
+        var i = 4
+        let execStart = i
+        while i < size && buffer[i] != 0 { i += 1 }
+        let execPath = String(decoding: buffer[execStart..<i], as: UTF8.self)
+        while i < size && buffer[i] == 0 { i += 1 }
+        var argv: [String] = []
+        while argv.count < argc && i < size {
+            let start = i
+            while i < size && buffer[i] != 0 { i += 1 }
+            argv.append(String(decoding: buffer[start..<i], as: UTF8.self))
+            i += 1
+        }
+        return Info(execPath: execPath, argv: argv)
+    }
+}
+
+enum ActivityScanner {
+    static let workingWindow: TimeInterval = 90
+
+    static func scan() -> ActivityInfo {
+        let open = ProcessScanner.ownProcesses().filter(isClaudeCode).count
+        let recent = recentTranscripts()
+        return ActivityInfo(open: open,
+                            working: open > 0 ? min(recent.sessions, open) : recent.sessions,
+                            agents: recent.agents)
+    }
+
+    /// Native kurulum ("claude", ~/.local/share/claude/versions/<sürüm>), Claude masaüstü
+    /// uygulamasının paketlediği claude-code ve npm (node …/claude-code/cli.js) kurulumu.
+    private static func isClaudeCode(_ p: ProcessScanner.Info) -> Bool {
+        if p.execName == "node" {
+            guard p.argv.count > 1 else { return false }
+            let script = p.argv[1]
+            return script.contains("claude-code") || (script as NSString).lastPathComponent == "claude"
+        }
+        return p.execName == "claude"
+            || p.arg0Name == "claude"
+            || p.execPath.contains("/.local/share/claude/versions/")
+            || p.execPath.contains("/claude-code/")
+    }
+
+    /// ~/.claude/projects altında son 90 sn içinde değişen kayıtlar:
+    /// <session>.jsonl = ana oturum, …/subagents/agent-*.jsonl = alt agent.
+    private static func recentTranscripts() -> (sessions: Int, agents: Int) {
+        let root = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".claude/projects")
+        let keys: [URLResourceKey] = [.contentModificationDateKey, .isRegularFileKey]
+        guard let walker = FileManager.default.enumerator(at: root,
+                                                          includingPropertiesForKeys: keys,
+                                                          options: [.skipsHiddenFiles])
+        else { return (0, 0) }
+        let cutoff = Date().addingTimeInterval(-workingWindow)
+        var sessions = 0
+        var agents = 0
+        for case let url as URL in walker {
+            guard url.pathExtension == "jsonl",
+                  let values = try? url.resourceValues(forKeys: Set(keys)),
+                  values.isRegularFile == true,
+                  let modified = values.contentModificationDate,
+                  modified > cutoff
+            else { continue }
+            if url.path.contains("/subagents/") || url.lastPathComponent.hasPrefix("agent-") {
+                agents += 1
+            } else {
+                sessions += 1
+            }
+        }
+        return (sessions, agents)
+    }
+}
+
 // MARK: - Store
 
 /// Son başarılı veri diskte saklanır: uygulama yeniden açılınca hemen görünür,
@@ -334,6 +444,8 @@ final class UsageStore: ObservableObject {
     @Published private(set) var isLoading = false
     @Published private(set) var now = Date()
     @Published private(set) var loginItemEnabled = LoginItem.isEnabled
+    @Published private(set) var activity: ActivityInfo?
+    private var activityTask: Task<Void, Never>?
     @Published private(set) var nextAttempt: Date?
 
     private var loop: Task<Void, Never>?
@@ -351,6 +463,7 @@ final class UsageStore: ObservableObject {
     static let maxBackoff: TimeInterval = 1800
 
     func start() {
+        startActivityLoop()
         if let cached = SnapshotCache.load() {
             snapshot = cached
             let age = Date().timeIntervalSince(cached.fetchedAt)
@@ -378,6 +491,18 @@ final class UsageStore: ObservableObject {
     private func refreshIfStale() {
         if let snap = snapshot, Date().timeIntervalSince(snap.fetchedAt) < Self.normalInterval { return }
         refreshNow()
+    }
+
+    /// Oturum/agent sayıları: yerel tarama, 15 sn'de bir (ağ isteği yok).
+    private func startActivityLoop() {
+        activityTask?.cancel()
+        activityTask = Task { [weak self] in
+            while !Task.isCancelled {
+                let info = await Task.detached(priority: .utility) { ActivityScanner.scan() }.value
+                self?.activity = info
+                try? await Task.sleep(nanoseconds: 15_000_000_000)
+            }
+        }
     }
 
     func setLoginItem(_ enabled: Bool) {
@@ -557,10 +682,25 @@ struct WidgetView: View {
         .environment(\.colorScheme, .dark)
     }
 
+    /// Açık oturum ve çalışan agent sayıları (yalnızca büyük kartta).
+    @ViewBuilder private var activityRows: some View {
+        if let a = store.activity {
+            VStack(alignment: .leading, spacing: 5) {
+                Divider().opacity(0.5)
+                ActivityRow(label: "Claude Code oturumu",
+                            value: "\(a.open) açık · \(a.working) çalışıyor")
+                ActivityRow(label: "Alt agent",
+                            value: (a.agents ?? 0) == 0 ? "çalışan yok" : "\(a.agents ?? 0) çalışıyor")
+            }
+            .help("Açık: Mac'te çalışan Claude Code süreçleri.\nÇalışıyor: son 90 sn içinde işlem yapan oturum ve alt agent'lar.")
+        }
+    }
+
     private var fullCard: some View {
         VStack(alignment: .leading, spacing: compact ? 8 : 11) {
             header
             content
+            activityRows
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 12)
@@ -756,6 +896,24 @@ struct WidgetView: View {
 /// Sürükleme başlangıcını tutan küçük referans tipi (@State yerine).
 final class DragTracker {
     var start: (mouse: NSPoint, origin: NSPoint)?
+}
+
+/// Etiket – değer satırı (oturum/agent sayıları).
+struct ActivityRow: View {
+    let label: String
+    let value: String
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline) {
+            Text(label)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(.secondary)
+            Spacer(minLength: 6)
+            Text(value)
+                .font(.system(size: 11, weight: .semibold))
+                .monospacedDigit()
+        }
+    }
 }
 
 /// Küçük şeritteki tek limit: etiket, mini bar, yüzde.
