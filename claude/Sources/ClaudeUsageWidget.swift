@@ -315,11 +315,13 @@ struct ActivityInfo: Sendable {
     let open: Int          // çalışan CLI süreçleri
     let working: Int       // son 90 sn içinde kaydına yazmış oturumlar
     let agents: Int?       // son 90 sn içinde çalışmış alt agent'lar (yoksa nil)
+    let projects: [ProjectActivity]
 }
 
 /// Kullanıcının kendi süreçlerini ve argv'lerini okur (ps çalıştırmadan, sysctl ile).
 enum ProcessScanner {
     struct Info {
+        let pid: pid_t
         let execPath: String
         let argv: [String]
 
@@ -359,7 +361,102 @@ enum ProcessScanner {
             argv.append(String(decoding: buffer[start..<i], as: UTF8.self))
             i += 1
         }
-        return Info(execPath: execPath, argv: argv)
+        return Info(pid: pid, execPath: execPath, argv: argv)
+    }
+
+    /// Süreçlerin çalışma klasörleri (proje). Tek bir lsof çağrısı.
+    static func workingDirectories(of pids: [pid_t]) -> [pid_t: String] {
+        guard !pids.isEmpty else { return [:] }
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
+        process.arguments = ["-a", "-d", "cwd", "-p", pids.map { String($0) }.joined(separator: ","), "-Fn"]
+        let out = Pipe()
+        process.standardOutput = out
+        process.standardError = FileHandle.nullDevice
+        do { try process.run() } catch { return [:] }
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        var result: [pid_t: String] = [:]
+        var current: pid_t?
+        for line in String(decoding: data, as: UTF8.self).split(separator: "\n") {
+            if line.hasPrefix("p") {
+                current = pid_t(line.dropFirst())
+            } else if line.hasPrefix("n"), let pid = current {
+                result[pid] = String(line.dropFirst())
+            }
+        }
+        return result
+    }
+}
+
+/// Proje bazında sayım.
+struct ProjectActivity: Sendable, Identifiable {
+    let id: String          // tam klasör yolu
+    let name: String        // klasör adı
+    var open: Int
+    var working: Int
+    var agents: Int
+
+    var isBusy: Bool { working > 0 || agents > 0 }
+}
+
+struct ProjectTally {
+    private var map: [String: ProjectActivity] = [:]
+
+    mutating func add(_ path: String?, open: Int = 0, working: Int = 0, agents: Int = 0) {
+        let key = (path?.isEmpty == false) ? path! : "?"
+        var p = map[key] ?? ProjectActivity(id: key, name: Self.displayName(key),
+                                            open: 0, working: 0, agents: 0)
+        p.open += open
+        p.working += working
+        p.agents += agents
+        map[key] = p
+    }
+
+    /// Önce çalışanlar, sonra açık olanlar, sonra ada göre.
+    var sorted: [ProjectActivity] {
+        map.values.sorted {
+            ($0.working + $0.agents, $0.open, $1.name) > ($1.working + $1.agents, $1.open, $0.name)
+        }
+    }
+
+    private static func displayName(_ path: String) -> String {
+        if path == "?" { return "bilinmeyen klasör" }
+        if path == FileManager.default.homeDirectoryForCurrentUser.path { return "~ (ana klasör)" }
+        let name = (path as NSString).lastPathComponent
+        return name.isEmpty ? path : name
+    }
+}
+
+/// Kayıt (jsonl) dosyasından "cwd" alanını okur: önce sondan 64 KB, bulamazsa baştan 64 KB.
+enum TranscriptReader {
+    private static let chunk: UInt64 = 65_536
+    private static let markers = ["\"cwd\":\"", "\"cwd\": \""]
+
+    static func cwd(of url: URL) -> String? {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+        if let end = try? handle.seekToEnd() {
+            try? handle.seek(toOffset: end > chunk ? end - chunk : 0)
+            if let data = try? handle.readToEnd(),
+               let value = extract(String(decoding: data, as: UTF8.self), backwards: true) {
+                return value
+            }
+        }
+        try? handle.seek(toOffset: 0)
+        guard let data = try? handle.read(upToCount: Int(chunk)) else { return nil }
+        return extract(String(decoding: data, as: UTF8.self), backwards: false)
+    }
+
+    private static func extract(_ text: String, backwards: Bool) -> String? {
+        for marker in markers {
+            guard let range = text.range(of: marker, options: backwards ? .backwards : []) else { continue }
+            let rest = text[range.upperBound...]
+            guard let end = rest.firstIndex(of: "\"") else { continue }
+            let value = String(rest[..<end]).replacingOccurrences(of: "\\/", with: "/")
+            if !value.isEmpty { return value }
+        }
+        return nil
     }
 }
 
@@ -367,11 +464,27 @@ enum ActivityScanner {
     static let workingWindow: TimeInterval = 90
 
     static func scan() -> ActivityInfo {
-        let open = ProcessScanner.ownProcesses().filter(isClaudeCode).count
-        let recent = recentTranscripts()
-        return ActivityInfo(open: open,
-                            working: open > 0 ? min(recent.sessions, open) : recent.sessions,
-                            agents: recent.agents)
+        let procs = ProcessScanner.ownProcesses().filter(isClaudeCode)
+        let dirs = ProcessScanner.workingDirectories(of: procs.map(\.pid))
+        var tally = ProjectTally()
+        for p in procs { tally.add(dirs[p.pid], open: 1) }
+
+        var sessions = 0
+        var agents = 0
+        for item in recentTranscripts() {
+            let cwd = TranscriptReader.cwd(of: item.url)
+            if item.isAgent {
+                agents += 1
+                tally.add(cwd, agents: 1)
+            } else {
+                sessions += 1
+                tally.add(cwd, working: 1)
+            }
+        }
+        return ActivityInfo(open: procs.count,
+                            working: procs.isEmpty ? sessions : min(sessions, procs.count),
+                            agents: agents,
+                            projects: tally.sorted)
     }
 
     /// Native kurulum ("claude", ~/.local/share/claude/versions/<sürüm>), Claude masaüstü
@@ -390,17 +503,16 @@ enum ActivityScanner {
 
     /// ~/.claude/projects altında son 90 sn içinde değişen kayıtlar:
     /// <session>.jsonl = ana oturum, …/subagents/agent-*.jsonl = alt agent.
-    private static func recentTranscripts() -> (sessions: Int, agents: Int) {
+    private static func recentTranscripts() -> [(url: URL, isAgent: Bool)] {
         let root = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".claude/projects")
         let keys: [URLResourceKey] = [.contentModificationDateKey, .isRegularFileKey]
         guard let walker = FileManager.default.enumerator(at: root,
                                                           includingPropertiesForKeys: keys,
                                                           options: [.skipsHiddenFiles])
-        else { return (0, 0) }
+        else { return [] }
         let cutoff = Date().addingTimeInterval(-workingWindow)
-        var sessions = 0
-        var agents = 0
+        var found: [(url: URL, isAgent: Bool)] = []
         for case let url as URL in walker {
             guard url.pathExtension == "jsonl",
                   let values = try? url.resourceValues(forKeys: Set(keys)),
@@ -408,13 +520,10 @@ enum ActivityScanner {
                   let modified = values.contentModificationDate,
                   modified > cutoff
             else { continue }
-            if url.path.contains("/subagents/") || url.lastPathComponent.hasPrefix("agent-") {
-                agents += 1
-            } else {
-                sessions += 1
-            }
+            let isAgent = url.path.contains("/subagents/") || url.lastPathComponent.hasPrefix("agent-")
+            found.append((url, isAgent))
         }
-        return (sessions, agents)
+        return found
     }
 }
 
@@ -693,6 +802,23 @@ struct WidgetView: View {
                             value: (a.agents ?? 0) == 0 ? "çalışan yok" : "\(a.agents ?? 0) çalışıyor")
             }
             .help("Açık: Mac'te çalışan Claude Code süreçleri.\nÇalışıyor: son 90 sn içinde işlem yapan oturum ve alt agent'lar.")
+
+            if !a.projects.isEmpty {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Projeler")
+                        .font(.system(size: 9.5, weight: .semibold))
+                        .foregroundStyle(.tertiary)
+                    ForEach(a.projects.prefix(6)) { project in
+                        ProjectRow(project: project, showAgents: true)
+                    }
+                    if a.projects.count > 6 {
+                        Text("+\(a.projects.count - 6) proje daha")
+                            .font(.system(size: 9.5))
+                            .foregroundStyle(.tertiary)
+                    }
+                }
+                .padding(.top, 2)
+            }
         }
     }
 
@@ -704,7 +830,7 @@ struct WidgetView: View {
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 12)
-        .frame(width: compact ? 210 : 264, alignment: .leading)
+        .frame(width: compact ? 220 : 284, alignment: .leading)
         .background(VisualEffectBackground(cornerRadius: 16))
         .overlay(
             RoundedRectangle(cornerRadius: 16, style: .continuous)
@@ -896,6 +1022,40 @@ struct WidgetView: View {
 /// Sürükleme başlangıcını tutan küçük referans tipi (@State yerine).
 final class DragTracker {
     var start: (mouse: NSPoint, origin: NSPoint)?
+}
+
+/// Proje satırı: yeşil nokta = o an çalışıyor.
+struct ProjectRow: View {
+    let project: ProjectActivity
+    let showAgents: Bool
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Circle()
+                .fill(project.isBusy ? Color.green.opacity(0.85) : Color.primary.opacity(0.25))
+                .frame(width: 5, height: 5)
+            Text(project.name)
+                .font(.system(size: 10.5, weight: .medium))
+                .lineLimit(1)
+                .truncationMode(.middle)
+            Spacer(minLength: 6)
+            Text(detail)
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+                .monospacedDigit()
+                .lineLimit(1)
+                .layoutPriority(1)
+        }
+        .help(project.id)
+    }
+
+    private var detail: String {
+        var parts: [String] = []
+        if project.open > 0 { parts.append("\(project.open) açık") }
+        if project.working > 0 { parts.append("\(project.working) çalışıyor") }
+        if showAgents && project.agents > 0 { parts.append("\(project.agents) agent") }
+        return parts.isEmpty ? "—" : parts.joined(separator: " · ")
+    }
 }
 
 /// Etiket – değer satırı (oturum/agent sayıları).
