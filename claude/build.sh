@@ -51,9 +51,9 @@ sleep 0.5
 rm -rf "$DEST/$APP_NAME.app"
 cp -R "$APP" "$DEST/"
 
-echo "→ Bağlantı testi…"
-"$DEST/$APP_NAME.app/Contents/MacOS/$APP_NAME" --once \
-  || echo "  (Test başarısız oldu; widget yine açılacak ve hatayı üzerinde gösterecek.)"
+# Not: Anthropic'in kullanım endpoint'i sıkı bir istek kotası uyguluyor (Claude Code
+# oturumlarıyla ortak). Kotayı boşa harcamamak için burada ayrıca bağlantı testi yapılmıyor;
+# teşhis için:  "$DEST/$APP_NAME.app/Contents/MacOS/$APP_NAME" --once
 
 echo "→ Başlatılıyor…"
 open "$DEST/$APP_NAME.app"

@@ -20,7 +20,7 @@ import SwiftUI
 
 // MARK: - Models
 
-struct LimitWindow: Identifiable, Sendable {
+struct LimitWindow: Identifiable, Sendable, Codable {
     let id: String                      // API anahtarı, örn. "five_hour"
     let title: String
     let percent: Double                 // 0–100
@@ -28,13 +28,13 @@ struct LimitWindow: Identifiable, Sendable {
     let windowLength: TimeInterval?     // tempo işareti için pencere uzunluğu
 }
 
-struct ExtraUsage: Sendable {
+struct ExtraUsage: Sendable, Codable {
     let used: Double?                   // USD
     let limit: Double?                  // USD
     let percent: Double?
 }
 
-struct UsageSnapshot: Sendable {
+struct UsageSnapshot: Sendable, Codable {
     let windows: [LimitWindow]
     let extra: ExtraUsage?
     let plan: String?
@@ -44,7 +44,7 @@ struct UsageSnapshot: Sendable {
 enum UsageError: Error, Sendable {
     case noCredentials
     case unauthorized(expired: Bool)
-    case rateLimited
+    case rateLimited(retryAfter: TimeInterval?)
     case http(Int)
     case network(String)
     case badResponse
@@ -58,7 +58,7 @@ enum UsageError: Error, Sendable {
                 ? "Giriş anahtarının süresi dolmuş. Claude Code'u bir kez açman yeterli, widget kendini toparlar."
                 : "Yetki reddedildi. Claude Code'da /login ile yeniden giriş yapmayı dene."
         case .rateLimited:
-            return "Çok sık istek gönderildi, birkaç dakika sonra tekrar denenecek."
+            return "Anthropic istekleri geçici olarak sınırladı (Claude Code oturumların da aynı kotayı kullanıyor). Otomatik olarak tekrar denenecek."
         case .http(let code):
             return "Sunucu hatası (HTTP \(code)). Tekrar denenecek."
         case .network:
@@ -184,7 +184,9 @@ enum UsageAPI {
         switch http.statusCode {
         case 200: return data
         case 401, 403: throw UsageError.unauthorized(expired: false)
-        case 429: throw UsageError.rateLimited
+        case 429:
+            let retryAfter = http.value(forHTTPHeaderField: "Retry-After").flatMap { Double($0) }
+            throw UsageError.rateLimited(retryAfter: (retryAfter ?? 0) > 0 ? retryAfter : nil)
         default: throw UsageError.http(http.statusCode)
         }
     }
@@ -308,6 +310,23 @@ enum UsageParser {
 
 // MARK: - Store
 
+/// Son başarılı veri diskte saklanır: uygulama yeniden açılınca hemen görünür,
+/// gereksiz yere yeni istek atılmaz.
+enum SnapshotCache {
+    private static let key = "lastSnapshot"
+
+    static func save(_ snapshot: UsageSnapshot) {
+        if let data = try? JSONEncoder().encode(snapshot) {
+            UserDefaults.standard.set(data, forKey: key)
+        }
+    }
+
+    static func load() -> UsageSnapshot? {
+        guard let data = UserDefaults.standard.data(forKey: key) else { return nil }
+        return try? JSONDecoder().decode(UsageSnapshot.self, from: data)
+    }
+}
+
 @MainActor
 final class UsageStore: ObservableObject {
     @Published private(set) var snapshot: UsageSnapshot?
@@ -315,37 +334,74 @@ final class UsageStore: ObservableObject {
     @Published private(set) var isLoading = false
     @Published private(set) var now = Date()
     @Published private(set) var loginItemEnabled = LoginItem.isEnabled
+    @Published private(set) var nextAttempt: Date?
 
     private var loop: Task<Void, Never>?
     private var ticker: Timer?
     private var wakeObserver: NSObjectProtocol?
+    private var lastAttempt: Date?
+    private var backoff: TimeInterval = 0          // 0 = sınırlama yok
 
-    static let normalInterval: TimeInterval = 60
+    /// Endpoint, açık Claude Code oturumlarıyla ortak ve sıkı bir istek kotası kullanıyor.
+    /// Limit yüzdeleri yavaş değiştiği için 5 dakikada bir yenilemek yeterli.
+    static let normalInterval: TimeInterval = 300
     static let errorInterval: TimeInterval = 120
-    static let rateLimitInterval: TimeInterval = 300
+    static let minManualGap: TimeInterval = 60
+    static let minBackoff: TimeInterval = 600       // 429 → 10 dk, sonra 20, en fazla 30 dk
+    static let maxBackoff: TimeInterval = 1800
 
     func start() {
-        startLoop()
+        if let cached = SnapshotCache.load() {
+            snapshot = cached
+            let age = Date().timeIntervalSince(cached.fetchedAt)
+            startLoop(initialDelay: age < Self.normalInterval ? Self.normalInterval - age : 0)
+        } else {
+            startLoop()
+        }
         ticker = Timer.scheduledTimer(withTimeInterval: 20, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.now = Date() }
         }
         wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
         ) { [weak self] _ in
-            Task { @MainActor in self?.refreshNow() }
+            Task { @MainActor in self?.refreshIfStale() }
         }
     }
 
-    func refreshNow() { startLoop() }
+    /// Elle yenileme: çok sık tıklamayı ve sınırlama sürerken tekrar denemeyi engeller.
+    func refreshNow() {
+        if let last = lastAttempt, Date().timeIntervalSince(last) < Self.minManualGap { return }
+        if backoff > 0, let next = nextAttempt, next > Date() { return }
+        startLoop()
+    }
+
+    private func refreshIfStale() {
+        if let snap = snapshot, Date().timeIntervalSince(snap.fetchedAt) < Self.normalInterval { return }
+        refreshNow()
+    }
 
     func setLoginItem(_ enabled: Bool) {
         LoginItem.set(enabled)
         loginItemEnabled = LoginItem.isEnabled
     }
 
-    private func startLoop() {
+    /// Veri varken hata olursa gösterilecek kısa not.
+    func staleNote(for error: UsageError, snapshot: UsageSnapshot) -> String {
+        let shown = Fmt.clock.string(from: snapshot.fetchedAt)
+        let retry = nextAttempt.map { " Tekrar deneme: \(Fmt.clock.string(from: $0))." } ?? ""
+        if case .rateLimited = error {
+            return "Anthropic istekleri geçici olarak sınırladı; \(shown) verisi gösteriliyor.\(retry)"
+        }
+        return "\(error.message) \(shown) verisi gösteriliyor."
+    }
+
+    private func startLoop(initialDelay: TimeInterval = 0) {
         loop?.cancel()
+        nextAttempt = Date().addingTimeInterval(initialDelay)
         loop = Task { [weak self] in
+            if initialDelay > 0 {
+                try? await Task.sleep(nanoseconds: UInt64(initialDelay * 1_000_000_000))
+            }
             while !Task.isCancelled {
                 guard let self else { return }
                 let delay = await self.refresh()
@@ -356,22 +412,34 @@ final class UsageStore: ObservableObject {
 
     /// Bir sonraki denemeye kadar beklenecek süreyi döndürür.
     private func refresh() async -> TimeInterval {
-        if isLoading { return Self.normalInterval }
+        if isLoading { return schedule(Self.normalInterval) }
         isLoading = true
+        lastAttempt = Date()
         defer { isLoading = false }
         do {
-            snapshot = try await UsageAPI.fetch()
+            let fresh = try await UsageAPI.fetch()
+            snapshot = fresh
+            SnapshotCache.save(fresh)
             error = nil
+            backoff = 0
             now = Date()
-            return Self.normalInterval
+            return schedule(Self.normalInterval)
         } catch let e as UsageError {
             error = e
-            if case .rateLimited = e { return Self.rateLimitInterval }
-            return Self.errorInterval
+            if case .rateLimited(let retryAfter) = e {
+                backoff = min(max(backoff * 2, Self.minBackoff), Self.maxBackoff)
+                return schedule(max(backoff, retryAfter ?? 0))
+            }
+            return schedule(Self.errorInterval)
         } catch {
             self.error = .network(error.localizedDescription)
-            return Self.errorInterval
+            return schedule(Self.errorInterval)
         }
+    }
+
+    private func schedule(_ delay: TimeInterval) -> TimeInterval {
+        nextAttempt = Date().addingTimeInterval(delay)
+        return delay
     }
 }
 
@@ -561,9 +629,9 @@ struct WidgetView: View {
                 ExtraRow(extra: extra)
             }
             if let err = store.error, !compact {
-                Text(err.message)
+                Text(store.staleNote(for: err, snapshot: snap))
                     .font(.system(size: 10))
-                    .foregroundStyle(Color.orange)
+                    .foregroundStyle(Color.orange.opacity(0.9))
                     .fixedSize(horizontal: false, vertical: true)
             }
         } else if let err = store.error {
